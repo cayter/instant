@@ -6,7 +6,7 @@ on:
       - main
 
 jobs:
-  go:
+  server:
     runs-on: ubuntu-24.04
 
     steps:
