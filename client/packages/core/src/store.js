@@ -1,8 +1,5 @@
-import { produce, enableMapSet } from "immer";
+import { create } from "mutative";
 import { immutableDeepMerge } from "./utils/object";
-
-// Makes immer work with maps and sets
-enableMapSet();
 
 function hasEA(attr) {
   return attr["cardinality"] === "one";
@@ -61,6 +58,7 @@ function createIndexMap(attrs, triples) {
       console.warn("no such attr", eid, attrs);
       continue;
     }
+
     if (isRef(attr)) {
       setInMap(vae, [v, aid, eid], triple);
     }
@@ -68,13 +66,57 @@ function createIndexMap(attrs, triples) {
     setInMap(eav, [eid, aid, v], triple);
     setInMap(aev, [aid, eid, v], triple);
   }
-
   return { eav, aev, vae };
 }
 
-export function createStore(attrs, triples) {
+export function blobAttrs({ attrs }, etype) {
+  return Object.values(attrs)
+    .filter((attr) => isBlob(attr) && attr['forward-identity'][1] === etype);
+}
+
+export function getAsObject(store, attrs, e) {
+  const obj = {}; 
+  for (const attr of attrs) { 
+    const aMap = store.eav.get(e)?.get(attr.id);
+    const vs = allMapValues(aMap, 1);
+    for (const v of vs) {  
+      obj[attr['forward-identity'][2]] = v[2];
+    }
+  }
+  return obj;
+}
+
+export function toJSON(store) {
+  return {
+    __type: store.__type,
+    attrs: store.attrs,
+    triples: allMapValues(store.eav, 3),
+    cardinalityInference: store.cardinalityInference,
+    linkIndex: store.linkIndex,
+  };
+}
+
+export function fromJSON(storeJSON) {
+  return createStore(
+    storeJSON.attrs,
+    storeJSON.triples,
+    storeJSON.cardinalityInference,
+    storeJSON.linkIndex,
+  );
+}
+
+export function createStore(
+  attrs,
+  triples,
+  enableCardinalityInference,
+  linkIndex,
+) {
   const store = createIndexMap(attrs, triples);
   store.attrs = attrs;
+  store.cardinalityInference = enableCardinalityInference;
+  store.linkIndex = linkIndex;
+  store.__type = "store";
+
   return store;
 }
 
@@ -200,7 +242,13 @@ function addTriple(store, rawTriple) {
     // For now, if we receive a command without an attr, we no-op.
     return;
   }
-  const enhancedTriple = [...triple, getCreatedAt(store, attr, triple)];
+
+  const existingTriple = getInMap(store.eav, [eid, aid, v]);
+  // Reuse the created_at for a triple if it's already in the store.
+  // Prevents updates from temporarily pushing an entity to the top
+  // while waiting for the server response.
+  const t = existingTriple?.[3] ?? getCreatedAt(store, attr, triple);
+  const enhancedTriple = [eid, aid, v, t];
 
   if (hasEA(attr)) {
     setInMap(store.eav, [eid, aid], new Map([[v, enhancedTriple]]));
@@ -247,22 +295,38 @@ function mergeTriple(store, rawTriple) {
   setInMap(store.eav, [eid, aid], new Map([[updatedValue, enhancedTriple]]));
 }
 
-function deleteEntity(store, rawTriple) {
-  const triple = resolveLookupRefs(store, rawTriple);
+function deleteEntity(store, args) {
+  const [lookup, etype] = args;
+  const triple = resolveLookupRefs(store, [lookup]);
+
   if (!triple) {
     return;
   }
   const [id] = triple;
 
-  // delete forward links
+  // delete forward links and attributes + cardinality one links
   const eMap = store.eav.get(id);
   if (eMap) {
     for (const a of eMap.keys()) {
-      deleteInMap(store.aev, [a, id]);
+      const attr = store.attrs[a];
+      if (
+        // Fall back to deleting everything if we've rehydrated tx-steps from
+        // the store that didn't set `etype` in deleteEntity
+        !etype ||
+        // If we don't know about the attr, let's just get rid of it
+        !attr ||
+        // Make sure it matches the etype
+        attr["forward-identity"]?.[1] === etype
+      ) {
+        deleteInMap(store.aev, [a, id]);
+        deleteInMap(store.eav, [id, a]);
+      }
+    }
+    // Clear out the eav index for `id` if we deleted all of the attributes
+    if (eMap.size === 0) {
+      deleteInMap(store.eav, [id]);
     }
   }
-  // delete object attributes + cardinality one links
-  deleteInMap(store.eav, [id]);
 
   // delete reverse links
   const vaeTriples = store.vae.get(id) && allMapValues(store.vae.get(id), 2);
@@ -270,11 +334,18 @@ function deleteEntity(store, rawTriple) {
   if (vaeTriples) {
     vaeTriples.forEach((triple) => {
       const [e, a, v] = triple;
-      deleteInMap(store.eav, [e, a, v]);
-      deleteInMap(store.aev, [a, e, v]);
+      const attr = store.attrs[a];
+      if (!etype || !attr || attr["reverse-identity"]?.[1] === etype) {
+        deleteInMap(store.eav, [e, a, v]);
+        deleteInMap(store.aev, [a, e, v]);
+        deleteInMap(store.vae, [v, a, e]);
+      }
     });
   }
-  deleteInMap(store.vae, [id]);
+  // Clear out vae index for `id` if we deleted all the reverse attributes
+  if (store.vae.get(id)?.size === 0) {
+    deleteInMap(store.vae, [id]);
+  }
 }
 
 // (XXX): Whenever we change/delete attrs,
@@ -420,6 +491,10 @@ export function getTriples(store, [e, a, v]) {
       }
       return res;
     }
+    case "a": {
+      const aMap = store.aev.get(a)
+      return allMapValues(aMap, 2);
+    }
     case "av": {
       const aMap = store.aev.get(a);
       if (!aMap) {
@@ -446,7 +521,7 @@ export function getTriples(store, [e, a, v]) {
 }
 
 export function transact(store, txSteps) {
-  return produce(store, (draft) => {
+  return create(store, (draft) => {
     txSteps.forEach((txStep) => {
       applyTxStep(draft, txStep);
     });

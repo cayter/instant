@@ -1,25 +1,54 @@
 import Reactor from "./Reactor";
-import { tx, lookup, TransactionChunk, EmptyChunk, getOps } from "./instatx";
+import {
+  tx,
+  txInit,
+  lookup,
+  getOps,
+  type TxChunk,
+  type TransactionChunk,
+} from "./instatx";
 import weakHash from "./utils/weakHash";
 import id from "./utils/uuid";
 import IndexedDBStorage from "./IndexedDBStorage";
 import WindowNetworkListener from "./WindowNetworkListener";
-import {
-  Query,
-  QueryResponse,
-  PageInfoResponse,
-  Exactly,
-  InstantObject,
-} from "./queryTypes";
-import { AuthState, User, AuthResult } from "./clientTypes";
-import {
+import { i } from "./schema";
+import { createDevtool } from "./devtool";
+
+import type {
   PresenceOpts,
   PresenceResponse,
   PresenceSlice,
   RoomSchemaShape,
 } from "./presence";
-import * as i from "./schema";
-import { createDevtool } from "./devtool";
+import type { IDatabase } from "./coreTypes";
+import type {
+  Query,
+  QueryResponse,
+  PageInfoResponse,
+  Exactly,
+  InstantObject,
+  InstaQLQueryParams,
+} from "./queryTypes";
+import type { AuthState, User, AuthResult } from "./clientTypes";
+import type {
+  InstantQuery,
+  InstantQueryResult,
+  InstantSchema,
+} from "./helperTypes";
+import type {
+  AttrsDefs,
+  CardinalityKind,
+  DataAttrDef,
+  EntitiesDef,
+  EntitiesWithLinks,
+  EntityDef,
+  InstantGraph,
+  LinkAttrDef,
+  LinkDef,
+  LinksDef,
+  ResolveAttrs,
+  ValueTypes,
+} from "./schemaTypes";
 
 const defaultOpenDevtool = true;
 
@@ -30,6 +59,10 @@ export type Config = {
   websocketURI?: string;
   apiURI?: string;
   devtool?: boolean;
+};
+
+export type ConfigWithSchema<S extends InstantGraph<any, any>> = Config & {
+  schema: S;
 };
 
 export type TransactionResult = {
@@ -59,15 +92,19 @@ export type RoomHandle<PresenceShape, TopicsByKey> = {
 
 type AuthToken = string;
 
-type SubscriptionState<Q, Schema> =
+type SubscriptionState<Q, Schema, WithCardinalityInference extends boolean> =
   | { error: { message: string }; data: undefined; pageInfo: undefined }
   | {
       error: undefined;
-      data: QueryResponse<Q, Schema>;
+      data: QueryResponse<Q, Schema, WithCardinalityInference>;
       pageInfo: PageInfoResponse<Q>;
     };
 
-type LifecycleSubscriptionState<Q, Schema> = SubscriptionState<Q, Schema> & {
+type LifecycleSubscriptionState<
+  Q,
+  Schema,
+  WithCardinalityInference extends boolean,
+> = SubscriptionState<Q, Schema, WithCardinalityInference> & {
   isLoading: boolean;
 };
 
@@ -81,19 +118,39 @@ const defaultConfig = {
 };
 
 // hmr
-
-function initGlobalInstantCoreStore(): Record<string, InstantCore<any>> {
-  if (typeof window !== "undefined") {
-    // @ts-expect-error
-    window.__instantDbStore = window.__instantDbStore ?? {};
-    // @ts-expect-error
-    return window.__instantDbStore;
-  }
-
-  return {};
+function initGlobalInstantCoreStore(): Record<
+  string,
+  InstantCore<any, any, any>
+> {
+  globalThis.__instantDbStore = globalThis.__instantDbStore ?? {};
+  return globalThis.__instantDbStore;
 }
 
 const globalInstantCoreStore = initGlobalInstantCoreStore();
+
+function init_experimental<
+  Schema extends InstantGraph<any, any, any>,
+  WithCardinalityInference extends boolean = true,
+>(
+  config: Config & {
+    schema: Schema;
+    cardinalityInference?: WithCardinalityInference;
+  },
+  Storage?: any,
+  NetworkListener?: any,
+): InstantCore<
+  Schema,
+  Schema extends InstantGraph<any, infer RoomSchema, any> ? RoomSchema : never,
+  WithCardinalityInference
+> {
+  return _init_internal<
+    Schema,
+    Schema extends InstantGraph<any, infer RoomSchema, any>
+      ? RoomSchema
+      : never,
+    WithCardinalityInference
+  >(config, Storage, NetworkListener);
+}
 
 // main
 
@@ -117,14 +174,27 @@ const globalInstantCoreStore = initGlobalInstantCoreStore();
  *  const db = init<Schema>({ appId: "my-app-id" })
  *
  */
-function init<Schema = {}, RoomSchema extends RoomSchemaShape = {}>(
+function init<Schema extends {} = {}, RoomSchema extends RoomSchemaShape = {}>(
   config: Config,
   Storage?: any,
   NetworkListener?: any,
 ): InstantCore<Schema, RoomSchema> {
+  return _init_internal(config, Storage, NetworkListener);
+}
+
+function _init_internal<
+  Schema extends {} | InstantGraph<any, any, any>,
+  RoomSchema extends RoomSchemaShape,
+  WithCardinalityInference extends boolean = false,
+>(
+  config: Config,
+  Storage?: any,
+  NetworkListener?: any,
+): InstantCore<Schema, RoomSchema, WithCardinalityInference> {
   const existingClient = globalInstantCoreStore[config.appId] as InstantCore<
-    Schema,
-    RoomSchema
+    any,
+    RoomSchema,
+    WithCardinalityInference
   >;
 
   if (existingClient) {
@@ -140,7 +210,9 @@ function init<Schema = {}, RoomSchema extends RoomSchemaShape = {}>(
     NetworkListener || WindowNetworkListener,
   );
 
-  const client = new InstantCore<Schema, RoomSchema>(reactor);
+  const client = new InstantCore<any, RoomSchema, WithCardinalityInference>(
+    reactor,
+  );
   globalInstantCoreStore[config.appId] = client;
 
   if (typeof window !== "undefined" && typeof window.location !== "undefined") {
@@ -160,10 +232,21 @@ function init<Schema = {}, RoomSchema extends RoomSchemaShape = {}>(
   return client;
 }
 
-class InstantCore<Schema = {}, RoomSchema extends RoomSchemaShape = {}> {
+class InstantCore<
+  Schema extends InstantGraph<any, any> | {} = {},
+  RoomSchema extends RoomSchemaShape = {},
+  WithCardinalityInference extends boolean = false,
+> implements IDatabase<Schema, RoomSchema, WithCardinalityInference>
+{
+  public withCardinalityInference?: WithCardinalityInference;
   public _reactor: Reactor<RoomSchema>;
   public auth: Auth;
   public storage: Storage;
+
+  public tx =
+    txInit<
+      Schema extends InstantGraph<any, any> ? Schema : InstantGraph<any, any>
+    >();
 
   constructor(reactor: Reactor<RoomSchema>) {
     this._reactor = reactor;
@@ -195,7 +278,7 @@ class InstantCore<Schema = {}, RoomSchema extends RoomSchemaShape = {}> {
    *  ])
    */
   transact(
-    chunks: TransactionChunk | TransactionChunk[],
+    chunks: TransactionChunk<any, any> | TransactionChunk<any, any>[],
   ): Promise<TransactionResult> {
     return this._reactor.pushTx(chunks);
   }
@@ -228,9 +311,13 @@ class InstantCore<Schema = {}, RoomSchema extends RoomSchemaShape = {}> {
    *    console.log(resp.data.goals)
    *  });
    */
-  subscribeQuery<Q extends Query>(
-    query: Exactly<Query, Q>,
-    cb: (resp: SubscriptionState<Q, Schema>) => void,
+  subscribeQuery<
+    Q extends Schema extends InstantGraph<any, any>
+      ? InstaQLQueryParams<Schema>
+      : Exactly<Query, Q>,
+  >(
+    query: Q,
+    cb: (resp: SubscriptionState<Q, Schema, WithCardinalityInference>) => void,
   ) {
     return this._reactor.subscribeQuery(query, cb);
   }
@@ -390,7 +477,7 @@ class Auth {
   signInWithIdToken = (params: {
     idToken: string;
     clientName: string;
-    nonce: string | undefined | null;
+    nonce?: string | undefined | null;
   }) => {
     return this.db.signInWithIdToken(params);
   };
@@ -437,7 +524,7 @@ class Auth {
    * Sign out the current user
    */
   signOut = () => {
-    this.db.signOut();
+    return this.db.signOut();
   };
 }
 
@@ -453,11 +540,16 @@ class Storage {
    * @see https://instantdb.com/docs/storage
    * @example
    *   const [file] = e.target.files; // result of file input
-   *   const isSuccess = await db.storage.put('photos/demo.png', file);
+   *   const isSuccess = await db.storage.upload('photos/demo.png', file);
    */
-  put = (pathname: string, file: File) => {
+  upload = (pathname: string, file: File) => {
     return this.db.upload(pathname, file);
   };
+
+  /**
+   * @deprecated Use `db.storage.upload` instead
+   */
+  put = this.upload;
 
   /**
    * Retrieves a download URL for the provided path.
@@ -468,6 +560,17 @@ class Storage {
    */
   getDownloadUrl = (pathname: string) => {
     return this.db.getDownloadUrl(pathname);
+  };
+
+  /**
+   * Deletes a file by path name.
+   *
+   * @see https://instantdb.com/docs/storage
+   * @example
+   *   await db.storage.delete('photos/demo.png');
+   */
+  delete = (pathname: string) => {
+    return this.db.deleteFile(pathname);
   };
 }
 
@@ -483,8 +586,11 @@ function coerceQuery(o: any) {
 export {
   // bada bing bada boom
   init,
+  init_experimental,
+  _init_internal,
   id,
   tx,
+  txInit,
   lookup,
 
   // cli
@@ -500,20 +606,43 @@ export {
   Auth,
   Storage,
 
-  // types
-  RoomSchemaShape,
-  Query,
-  QueryResponse,
-  InstantObject,
-  Exactly,
-  TransactionChunk,
-  AuthState,
-  User,
-  AuthToken,
-  EmptyChunk,
-  SubscriptionState,
-  LifecycleSubscriptionState,
-  PresenceOpts,
-  PresenceSlice,
-  PresenceResponse,
+  // og types
+  type IDatabase,
+  type RoomSchemaShape,
+  type Query,
+  type QueryResponse,
+  type InstantObject,
+  type Exactly,
+  type TransactionChunk,
+  type AuthState,
+  type User,
+  type AuthToken,
+  type TxChunk,
+  type SubscriptionState,
+  type LifecycleSubscriptionState,
+
+  // presence types
+  type PresenceOpts,
+  type PresenceSlice,
+  type PresenceResponse,
+
+  // new query types
+  type InstaQLQueryParams,
+  type InstantQuery,
+  type InstantQueryResult,
+  type InstantSchema,
+
+  // schema types
+  type AttrsDefs,
+  type CardinalityKind,
+  type DataAttrDef,
+  type EntitiesDef,
+  type EntitiesWithLinks,
+  type EntityDef,
+  type InstantGraph,
+  type LinkAttrDef,
+  type LinkDef,
+  type LinksDef,
+  type ResolveAttrs,
+  type ValueTypes,
 };

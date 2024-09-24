@@ -25,7 +25,7 @@
    <a href="https://discord.com/invite/VU53p7uQcE">Discord</a>
 <p>
 
-Instant is a client-side database that makes it easy to build real-time and collaborative apps like Notion or Figma.
+Instant is a modern Firebase. We make you productive by giving your frontend a real-time database.
 
 You write [relational queries](https://www.instantdb.com/docs/instaql) in the shape of the data you want and Instant handles all the data fetching, permission checking, and offline caching. When you [change data](https://www.instantdb.com/docs/instaml), optimistic updates and rollbacks are handled for you as well. Plus, every query is multiplayer by default.
 
@@ -127,3 +127,9 @@ If you have any questions, you can jump in on our [discord](https://discord.com/
 You can start by joining our [discord](https://discord.com/invite/VU53p7uQcE) and introducing yourself. Even if you don't contribute code, we always love feedback.
 
 If you want to make changes, start by reading the [`client`](./client/) and [`server`](./server/) READMEs. There you'll find instructions to start Instant locally.
+
+## YourKit
+
+We're using YourKit to help us debug Instant. They are kindly supporting Instant and other open source projects with their [full-featured Java Profiler](https://www.yourkit.com/java/profiler/index.jsp).
+
+![yklogo](https://github.com/user-attachments/assets/64788da3-1dc4-4aa6-84cd-e051fd059fd0)

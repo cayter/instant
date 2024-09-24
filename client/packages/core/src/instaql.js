@@ -1,6 +1,7 @@
 import { query as datalogQuery } from "./datalog";
 import { uuidCompare } from "./utils/uuid";
 import { getAttrByFwdIdentName, getAttrByReverseIdentName } from "./instaml";
+import * as s from "./store"; 
 
 // Pattern variables
 // -----------------
@@ -46,10 +47,7 @@ function idAttr(store, ns) {
 }
 
 function defaultWhere(makeVar, store, etype, level) {
-  return [
-    eidWhere(makeVar, store, etype, level),
-    attrWhere(makeVar, etype, level),
-  ];
+  return [eidWhere(makeVar, store, etype, level)];
 }
 
 function eidWhere(makeVar, store, etype, level) {
@@ -57,15 +55,6 @@ function eidWhere(makeVar, store, etype, level) {
     makeVar(etype, level),
     idAttr(store, etype).id,
     makeVar(etype, level),
-    wildcard("time"),
-  ];
-}
-
-function attrWhere(makeVar, etype, level) {
-  return [
-    makeVar(etype, level),
-    makeVar("attr", level),
-    makeVar("val", level),
     makeVar("time", level),
   ];
 }
@@ -92,21 +81,23 @@ function refAttrPat(makeVar, store, etype, level, label) {
   const nextLevel = level + 1;
   const attrPat = fwdAttr
     ? [
-        makeVar(fwdEtype, level),
-        attr.id,
-        makeVar(revEtype, nextLevel),
-        wildcard("time"),
-      ]
+      makeVar(fwdEtype, level),
+      attr.id,
+      makeVar(revEtype, nextLevel),
+      wildcard("time"),
+    ]
     : [
-        makeVar(fwdEtype, nextLevel),
-        attr.id,
-        makeVar(revEtype, level),
-        wildcard("time"),
-      ];
+      makeVar(fwdEtype, nextLevel),
+      attr.id,
+      makeVar(revEtype, level),
+      wildcard("time"),
+    ];
 
   const nextEtype = fwdAttr ? revEtype : fwdEtype;
 
-  return [nextEtype, nextLevel, attrPat];
+  const isForward = Boolean(fwdAttr);
+
+  return [nextEtype, nextLevel, attrPat, attr, isForward];
 }
 
 function valueAttrPat(makeVar, store, valueEtype, valueLevel, valueLabel, v) {
@@ -227,19 +218,14 @@ function makeWhere(store, etype, level, where) {
 // -----------------
 
 function makeFind(makeVar, etype, level) {
-  return [
-    makeVar(etype, level),
-    makeVar("attr", level),
-    makeVar("val", level),
-    makeVar("time", level),
-  ];
+  return [makeVar(etype, level), makeVar("time", level)];
 }
 
 // extendObjects
 // -----------------
 
 function makeJoin(makeVar, store, etype, level, label, eid) {
-  const [nextEtype, nextLevel, pat] = refAttrPat(
+  const [nextEtype, nextLevel, pat, attr, isForward] = refAttrPat(
     makeVar,
     store,
     etype,
@@ -247,7 +233,7 @@ function makeJoin(makeVar, store, etype, level, label, eid) {
     label,
   );
   const actualized = replaceInAttrPat(pat, makeVar(etype, level), eid);
-  return [nextEtype, nextLevel, actualized];
+  return [nextEtype, nextLevel, actualized, attr, isForward];
 }
 
 function extendObjects(makeVar, store, { etype, level, form }, objects) {
@@ -257,6 +243,11 @@ function extendObjects(makeVar, store, { etype, level, form }, objects) {
   }
   return Object.entries(objects).map(([eid, parent]) => {
     const childResults = children.map((label) => {
+      const isSingular = Boolean(
+        store.cardinalityInference &&
+        store.linkIndex?.[etype]?.[label]?.isSingular,
+      );
+
       try {
         const [nextEtype, nextLevel, join] = makeJoin(
           makeVar,
@@ -266,16 +257,20 @@ function extendObjects(makeVar, store, { etype, level, form }, objects) {
           label,
           eid,
         );
-        const child = queryOne(store, {
+
+        const childrenArray = queryOne(store, {
           etype: nextEtype,
           level: nextLevel,
           form: form[label],
           join,
         });
-        return { [label]: child };
+
+        const childOrChildren = isSingular ? childrenArray[0] : childrenArray;
+
+        return { [label]: childOrChildren };
       } catch (e) {
         if (e instanceof AttrNotFoundError) {
-          return { [label]: [] };
+          return { [label]: isSingular ? undefined : [] };
         }
         throw e;
       }
@@ -313,7 +308,7 @@ function cursorCompare(direction, typ) {
   }
 }
 
-function isBefore(startCursor, direction, [e, a, _v, t]) {
+function isBefore(startCursor, direction, [e, _a, _v, t]) {
   return (
     cursorCompare(direction, "number")(t, startCursor[3]) ||
     (t === startCursor[3] &&
@@ -322,43 +317,29 @@ function isBefore(startCursor, direction, [e, a, _v, t]) {
 }
 
 function runDataloadAndReturnObjects(store, etype, direction, pageInfo, dq) {
-  const startCursor = pageInfo?.["start-cursor"];
-  const toRemove = [];
-  const res = datalogQuery(store, dq)
-    .sort((tripleA, tripleB) => {
-      const tsA = tripleA[3];
-      const tsB = tripleB[3];
+  const aid = idAttr(store, etype).id;
+  const idVecs = datalogQuery(store, dq)
+    .sort(([_, tsA], [__, tsB]) => {
       return direction === "desc" ? tsB - tsA : tsA - tsB;
-    })
-    .reduce((res, triple) => {
-      const [e, a, v] = triple;
-      if (shouldIgnoreAttr(store.attrs, a)) {
-        return res;
-      }
-      const attr = store.attrs[a];
-      const [_, attrEtype, label] = attr["forward-identity"];
-      if (attrEtype !== etype) {
-        return res;
-      }
+    });
 
-      if (
-        startCursor &&
-        a === startCursor[1] &&
-        isBefore(startCursor, direction, triple)
-      ) {
-        toRemove.push(e);
-      }
-
-      res[e] = res[e] || {};
-      res[e][label] = v;
-      return res;
-    }, {});
-
-  // remove anything before our start cursor
-  for (const e of toRemove) {
-    delete res[e];
+  let objects = {}
+  const startCursor = pageInfo?.["start-cursor"];
+  const blobAttrs = s.blobAttrs(store, etype);
+  for (const [id, time] of idVecs) {
+    if (
+      startCursor &&
+      aid === startCursor[1] &&
+      isBefore(startCursor, direction, [id, aid, id, time])
+    ) {
+      continue;
+    }
+    const obj = s.getAsObject(store, blobAttrs, id);
+    if (obj) {
+      objects[id] = obj;
+    }
   }
-  return res;
+  return objects;
 }
 
 function determineOrder(form) {

@@ -77,13 +77,14 @@ function createIframe(src: string) {
     height: "100%",
     borderRadius: "4px",
     backgroundColor: "white",
+    border: "none",
   } as Partial<CSSStyleDeclaration>);
   return { element };
 }
 
 function createToggler(onClick) {
   const logoSVG = `
-    <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <svg width="32" height="32" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
       <rect width="512" height="512" fill="black"/>
       <rect x="97.0973" y="91.3297" width="140" height="330" fill="white"/>
     </svg>
@@ -101,6 +102,11 @@ function createToggler(onClick) {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
+    // look
+    padding: "0",
+    margin: "0",
+    border: "none",
+    cursor: "pointer",
   } as Partial<CSSStyleDeclaration>);
   element.addEventListener("click", onClick);
   return { element };
